@@ -1,136 +1,199 @@
 import random
-import re
-import torch
-
-from datasets import load_dataset, concatenate_datasets
-from transformers import AutoTokenizer
-from torch.utils.data import Dataset
-
-MAX_LEN = 128
-MLM_PROB = 0.15
+from typing import List
+from datasets import load_dataset
+from transformers import BertTokenizerFast
+from tensorflow.core.example import example_pb2
 
 
-def split_sentences(text):
-    if text is None:
-        return []
+class Config:
+    model_name = "bert-base-uncased"
+    max_seq_length = 128
+    max_predictions_per_seq = 20
+    masked_lm_prob = 0.15
+    dupe_factor = 5
+    random_seed = 1234
+    output_file = "wiki_bert_pretrain.pb"
 
-    text = text.strip()
-    return [s for s in re.split(r'(?<=[.!?])\s+', text) if len(s) > 5]
+
+class TrainingInstance:
+    def __init__(self, tokens, segment_ids, masked_lm_positions,
+                 masked_lm_labels, is_random_next):
+        self.tokens = tokens
+        self.segment_ids = segment_ids
+        self.masked_lm_positions = masked_lm_positions
+        self.masked_lm_labels = masked_lm_labels
+        self.is_random_next = is_random_next
 
 
-def load_wikipedia_corpus():
-    wiki_en = load_dataset("wikipedia", "20220301.en", split="train")
-    wiki_mt = load_dataset("wikipedia", "20220301.mt", split="train")
-
-    wiki = concatenate_datasets([wiki_en, wiki_mt])
-
-    wiki = wiki.remove_columns(
-        [c for c in wiki.column_names if c != "text"]
+def create_int_feature(values):
+    return example_pb2.Feature(
+        int64_list=example_pb2.Int64List(value=list(values))
     )
 
-    wiki = wiki.filter(lambda x: x["text"] is not None and len(x["text"]) > 50)
 
-    return wiki
-
-
-def mask_tokens(input_ids, tokenizer):
-    labels = input_ids.clone()
-
-    prob = torch.full(labels.shape, MLM_PROB)
-
-    special_tokens_mask = tokenizer.get_special_tokens_mask(
-        input_ids.tolist(),
-        already_has_special_tokens=True
+def create_float_feature(values):
+    return example_pb2.Feature(
+        float_list=example_pb2.FloatList(value=list(values))
     )
 
-    prob.masked_fill_(
-        torch.tensor(special_tokens_mask, dtype=torch.bool),
-        0.0
-    )
 
-    masked_indices = torch.bernoulli(prob).bool()
-
-    labels[~masked_indices] = -100
-    input_ids[masked_indices] = tokenizer.mask_token_id
-
-    return input_ids, labels
-
-
-def create_sentence_pairs(wiki_dataset):
-    documents = wiki_dataset["text"]
-    doc_count = len(documents)
-
-    pairs = []
-
-    for doc in documents:
-        if doc is None:
+def create_masked_lm_predictions(tokens, tokenizer, cfg, rng):
+    cand_indices = []
+    for i, token in enumerate(tokens):
+        if token in ["[CLS]", "[SEP]"]:
             continue
+        cand_indices.append(i)
 
-        sentences = split_sentences(doc)
+    rng.shuffle(cand_indices)
+    output_tokens = list(tokens)
 
-        if len(sentences) < 2:
-            continue
+    num_to_predict = min(
+        cfg.max_predictions_per_seq,
+        max(1, int(round(len(tokens) * cfg.masked_lm_prob)))
+    )
 
-        if random.random() < 0.5:
-            idx = random.randint(0, len(sentences) - 2)
-            s1 = sentences[idx]
-            s2 = sentences[idx + 1]
-            label = 0
+    masked_positions = []
+    masked_labels = []
+
+    for idx in cand_indices:
+        if len(masked_positions) >= num_to_predict:
+            break
+
+        masked_positions.append(idx)
+        masked_labels.append(tokens[idx])
+
+        if rng.random() < 0.8:
+            output_tokens[idx] = "[MASK]"
+        elif rng.random() < 0.5:
+            output_tokens[idx] = tokens[idx]
         else:
-            s1 = random.choice(sentences)
+            rand_id = rng.randint(0, tokenizer.vocab_size - 1)
+            output_tokens[idx] = tokenizer.convert_ids_to_tokens(rand_id)
 
-            rand_doc = documents[random.randint(0, doc_count - 1)]
-            rand_sents = split_sentences(rand_doc)
+    return output_tokens, masked_positions, masked_labels
 
-            if len(rand_sents) == 0:
+
+def truncate_seq_pair(tokens_a, tokens_b, max_len, rng):
+    while len(tokens_a) + len(tokens_b) > max_len:
+        if len(tokens_a) > len(tokens_b):
+            if rng.random() < 0.5:
+                del tokens_a[0]
+            else:
+                tokens_a.pop()
+        else:
+            if rng.random() < 0.5:
+                del tokens_b[0]
+            else:
+                tokens_b.pop()
+
+
+def create_instances(docs, tokenizer, cfg, rng):
+    instances = []
+    max_tokens = cfg.max_seq_length - 3
+
+    for _ in range(cfg.dupe_factor):
+        for doc_index in range(len(docs)):
+            document = docs[doc_index]
+            if len(document) < 2:
                 continue
 
-            s2 = random.choice(rand_sents)
-            label = 1
+            for i in range(len(document) - 1):
+                tokens_a = tokenizer.tokenize(document[i])
+                is_random_next = rng.random() < 0.5
 
-        pairs.append((s1, s2, label))
+                if is_random_next:
+                    rand_doc = docs[rng.randint(0, len(docs) - 1)]
+                    tokens_b = tokenizer.tokenize(
+                        rand_doc[rng.randint(0, len(rand_doc) - 1)]
+                    )
+                else:
+                    tokens_b = tokenizer.tokenize(document[i + 1])
 
-    return pairs
+                truncate_seq_pair(tokens_a, tokens_b, max_tokens, rng)
 
+                tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"]
+                segment_ids = (
+                    [0] * (len(tokens_a) + 2) +
+                    [1] * (len(tokens_b) + 1)
+                )
 
-class BertPretrainingDataset(Dataset):
-    def __init__(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "bert-base-multilingual-cased"
-        )
+                tokens, masked_pos, masked_labels = create_masked_lm_predictions(
+                    tokens, tokenizer, cfg, rng
+                )
 
-        wiki = load_wikipedia_corpus()
-        self.data = create_sentence_pairs(wiki)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        s1, s2, nsp_label = self.data[idx]
-
-        enc = self.tokenizer(
-            s1,
-            s2,
-            max_length=MAX_LEN,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        input_ids = enc["input_ids"].squeeze(0)
-        token_type_ids = enc["token_type_ids"].squeeze(0)
-
-        input_ids, mlm_labels = mask_tokens(
-            input_ids.clone(),
-            self.tokenizer
-        )
-
-        return {
-            "tokens": input_ids,
-            "segment_ids": token_type_ids,
-            "is_random_next": torch.tensor(nsp_label, dtype=torch.long)
-        }
+                instances.append(
+                    TrainingInstance(
+                        tokens,
+                        segment_ids,
+                        masked_pos,
+                        masked_labels,
+                        is_random_next
+                    )
+                )
+    return instances
 
 
-def build_dataset():
-    return BertPretrainingDataset()
+def save_instances(instances, tokenizer, cfg):
+    with open(cfg.output_file, "wb") as f:
+        for inst in instances:
+            input_ids = tokenizer.convert_tokens_to_ids(inst.tokens)
+            input_mask = [1] * len(input_ids)
+            segment_ids = list(inst.segment_ids)
+
+            while len(input_ids) < cfg.max_seq_length:
+                input_ids.append(0)
+                input_mask.append(0)
+                segment_ids.append(0)
+
+            masked_ids = tokenizer.convert_tokens_to_ids(inst.masked_lm_labels)
+            masked_weights = [1.0] * len(masked_ids)
+
+            masked_positions = list(inst.masked_lm_positions)
+
+            while len(masked_positions) < cfg.max_predictions_per_seq:
+                masked_positions.append(0)
+                masked_ids.append(0)
+                masked_weights.append(0.0)
+
+            example = example_pb2.Example()
+            features = example.features.feature
+
+            features["input_ids"].CopyFrom(create_int_feature(input_ids))
+            features["input_mask"].CopyFrom(create_int_feature(input_mask))
+            features["segment_ids"].CopyFrom(create_int_feature(segment_ids))
+            features["masked_lm_positions"].CopyFrom(
+                create_int_feature(masked_positions)
+            )
+            features["masked_lm_ids"].CopyFrom(
+                create_int_feature(masked_ids)
+            )
+            features["masked_lm_weights"].CopyFrom(
+                create_float_feature(masked_weights)
+            )
+            features["next_sentence_labels"].CopyFrom(
+                create_int_feature([1 if inst.is_random_next else 0])
+            )
+
+            f.write(example.SerializeToString())
+
+
+def main():
+    cfg = Config()
+    rng = random.Random(cfg.random_seed)
+
+    dataset = load_dataset("wikipedia", "20220301.en", split="train")
+    tokenizer = BertTokenizerFast.from_pretrained(cfg.model_name)
+
+    documents = []
+    for article in dataset:
+        paragraphs = article["text"].split("\n")
+        sentences = [p.strip() for p in paragraphs if len(p.strip()) > 0]
+        if len(sentences) > 1:
+            documents.append(sentences)
+
+    instances = create_instances(documents, tokenizer, cfg, rng)
+    save_instances(instances, tokenizer, cfg)
+
+
+if __name__ == "__main__":
+    main()
